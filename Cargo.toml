@@ -1,0 +1,35 @@
+[package]
+name = "sqlite-watcher"
+version = "0.1.0"
+edition = "2021"
+description = "Building block to observe database table changes in sqlite3"
+license = "AGPL-3"
+categories = ["database"]
+keywords = ["sqlite3", "invalidation", "tracking", "watcher"]
+authors = ["Leander Beernaert <lbb-dev@pm.me>"]
+readme = "README.md"
+repository = "https://gitlab.com/AngryPixel/sqlite-watcher"
+homepage= "https://gitlab.com/AngryPixel/sqlite-watcher"
+
+[dependencies]
+fixedbitset = "0.5.7"
+slotmap = "1.0.7"
+parking_lot = "0.12.3"
+tracing = "0.1.40"
+oneshot = "0.1.8"
+thiserror = "1.0.64"
+rusqlite= {version = "0.32.1", optional = true}
+
+[dev-dependencies]
+tempdir = "0.3.7"
+
+[features]
+default =["rusqlite"]
+rusqlite=["dep:rusqlite"]
+
+[lints.clippy]
+pedantic="deny"
+
+[[example]]
+name = "rusqlite"
+required-features = ["rusqlite"]
