@@ -3,7 +3,7 @@
 //! queries are not included, but can potentially be built using the provided types.
 //!
 //! The crate is agnostic over the implementation of the sqlite connection. Example
-//! implementation are provided for [`rusqlite`](https://crates.io/crates/rusqlite) and
+//! implementations are provided for [`rusqlite`](https://crates.io/crates/rusqlite) and
 //! [`sqlx`](https://crates.io/crates/sqlx) which need to be enabled by the respectively named
 //! features.
 //!

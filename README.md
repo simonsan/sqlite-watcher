@@ -1,12 +1,12 @@
 # sqlite-watcher
 
 
- This crate provides the basic building blocks to observe changes in a sqlite database
- similar to Room (Android) and Core Data (iOS). Additional features such as observable
- queries are not included, but can potentially be built using the provided types.
+This crate provides the basic building blocks to observe changes in a sqlite database
+similar to Room (Android) and Core Data (iOS). Additional features such as observable
+queries are not included, but can potentially be built using the provided types.
 
 The crate is agnostic over the implementation of the sqlite connection. Example
-implementation are provided for [`rusqlite`](https://crates.io/crates/rusqlite) and
+implementations are provided for [`rusqlite`](https://crates.io/crates/rusqlite) and
 [`sqlx`](https://crates.io/crates/sqlx) which need to be enabled by the respectively named
 features.
 
