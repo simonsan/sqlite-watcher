@@ -5,8 +5,10 @@
  similar to Room (Android) and Core Data (iOS). Additional features such as observable
  queries are not included, but can potentially be built using the provided types.
 
- The crate is agnostic over the implementation of the sqlite connection. An example
- implementation is provided for `rusqlite` which is enabled by default.
+The crate is agnostic over the implementation of the sqlite connection. Example
+implementation are provided for [`rusqlite`](https://crates.io/crates/rusqlite) and
+[`sqlx`](https://crates.io/crates/sqlx) which need to be enabled by the respectively named
+features.
 
  ## Basic example
 
