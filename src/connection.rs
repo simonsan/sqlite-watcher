@@ -1,12 +1,16 @@
 use crate::watcher::{ObservedTableOp, Watcher};
 use fixedbitset::FixedBitSet;
 use std::error::Error;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use tracing::debug;
 
 #[cfg(feature = "rusqlite")]
 pub mod rusqlite;
+
+#[cfg(feature = "sqlx")]
+pub mod sqlx;
 
 /// Defines an implementation capable of executing SQL statement on a sqlite connection.
 ///
@@ -19,7 +23,7 @@ pub trait SqlExecutor {
     /// # Errors
     ///
     /// Should return error if the query failed.
-    fn sql_query_values(&self, query: &str) -> Result<Vec<usize>, Self::Error>;
+    fn sql_query_values(&mut self, query: &str) -> Result<Vec<usize>, Self::Error>;
 
     /// Execute an sql statement which does not return any rows.
     ///
@@ -50,6 +54,54 @@ pub trait SqlTransaction: SqlExecutor {
     ///
     /// Should return an error if a transaction can't be committed.
     fn sql_commit_transaction(self) -> Result<(), Self::Error>;
+}
+
+/// Defines an implementation capable of executing SQL statement on a sqlite connection.
+///
+/// This is required so we can set up the temporary triggers and tables required to
+/// track changes.
+pub trait SqlExecutorAsync {
+    type Error: Error;
+    /// This method will execute a query which returns 0 or N rows with one column of type `usize`.
+    ///
+    /// # Errors
+    ///
+    /// Should return error if the query failed.
+    fn sql_query_values(
+        &mut self,
+        query: &str,
+    ) -> impl Future<Output = Result<Vec<usize>, Self::Error>> + Send;
+
+    /// Execute an sql statement which does not return any rows.
+    ///
+    /// # Errors
+    ///
+    /// Should return error if the query failed.
+    fn sql_execute(&mut self, query: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
+}
+
+/// Defines an implementation of a sqlite connection from which we can create an [`crate::connection::SqlTransaction`].
+#[allow(clippy::module_name_repetitions)]
+pub trait SqlConnectionAsync: SqlExecutorAsync {
+    /// Create a new transaction for the connection.
+    ///
+    /// # Errors
+    ///
+    /// Should return an error if the transaction can't be created.
+    fn sql_transaction(
+        &mut self,
+    ) -> impl Future<Output = Result<impl SqlTransactionAsync<Error = Self::Error> + '_, Self::Error>>
+           + Send;
+}
+
+/// Defines a transaction on a sqlite connection.
+pub trait SqlTransactionAsync: SqlExecutorAsync {
+    /// Commit the current transaction.
+    ///
+    /// # Errors
+    ///
+    /// Should return an error if a transaction can't be committed.
+    fn sql_commit_transaction(self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// Building block to provide tracking capabilities to any type of sqlite connection which
@@ -96,6 +148,21 @@ impl State {
         Ok(())
     }
 
+    /// Enable required pragmas for execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the pragma changes failed.
+    pub async fn set_pragmas_async<C: SqlConnectionAsync>(
+        connection: &mut C,
+    ) -> Result<(), C::Error> {
+        connection.sql_execute("PRAGMA temp_store = MEMORY").await?;
+        connection
+            .sql_execute("PRAGMA recursive_triggers='ON'")
+            .await?;
+        Ok(())
+    }
+
     /// Prepare the `connection` for tracking.
     ///
     /// This will create the temporary table used to track change.
@@ -106,9 +173,26 @@ impl State {
     pub fn start_tracking<C: SqlConnection>(connection: &mut C) -> Result<(), C::Error> {
         // create tracking table and cleanup previous data if re-used from a connection pool.
         let mut tx = connection.sql_transaction()?;
-        tx.sql_execute(&format!("CREATE TEMP TABLE IF NOT EXISTS {TRACKER_TABLE_NAME} (table_id INTEGER PRIMARY KEY, updated INTEGER)"))?;
-        tx.sql_execute(&format!("DELETE FROM {TRACKER_TABLE_NAME}"))?;
+        tx.sql_execute(&create_tracking_table_query())?;
+        tx.sql_execute(&empty_tracking_table_query())?;
         tx.sql_commit_transaction()
+    }
+
+    /// Prepare the `connection` for tracking.
+    ///
+    /// This will create the temporary table used to track change.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the initialization failed.
+    pub async fn start_tracking_async<C: SqlConnectionAsync>(
+        connection: &mut C,
+    ) -> Result<(), C::Error> {
+        // create tracking table and cleanup previous data if re-used from a connection pool.
+        let mut tx = connection.sql_transaction().await?;
+        tx.sql_execute(&create_tracking_table_query()).await?;
+        tx.sql_execute(&empty_tracking_table_query()).await?;
+        tx.sql_commit_transaction().await
     }
 
     /// Remove all triggers and the tracking table from `connection`.
@@ -124,10 +208,29 @@ impl State {
         let tables = watcher.observed_tables();
         let mut tx = connection.sql_transaction()?;
         for (id, table_name) in tables.into_iter().enumerate() {
-            Self::drop_triggers(&mut tx, &table_name, id)?;
+            drop_triggers(&mut tx, &table_name, id)?;
         }
-        tx.sql_execute(&format!("DROP TABLE IF EXISTS {TRACKER_TABLE_NAME}"))?;
+        tx.sql_execute(&drop_tracking_table_query())?;
         tx.sql_commit_transaction()
+    }
+
+    /// Remove all triggers and the tracking table from `connection`.
+    //
+    /// # Errors
+    ///
+    /// Returns error if the initialization failed.
+    pub async fn stop_tracking_async<C: SqlConnectionAsync>(
+        &self,
+        connection: &mut C,
+        watcher: &Watcher,
+    ) -> Result<(), C::Error> {
+        let tables = watcher.observed_tables();
+        let mut tx = connection.sql_transaction().await?;
+        for (id, table_name) in tables.into_iter().enumerate() {
+            drop_triggers_async(&mut tx, &table_name, id).await?;
+        }
+        tx.sql_execute(&drop_tracking_table_query()).await?;
+        tx.sql_commit_transaction().await
     }
 
     /// Create a new instance without initializing any connection.
@@ -153,22 +256,78 @@ impl State {
         connection: &mut C,
         watcher: &Watcher,
     ) -> Result<(), C::Error> {
-        self.sync(watcher, |tracker_changes| {
-            let mut tx = connection.sql_transaction()?;
-            for change in tracker_changes {
-                match change {
-                    ObservedTableOp::Add(table_name, id) => {
-                        debug!("Add watcher for table {table_name} id={id}");
-                        Self::create_triggers(&mut tx, table_name, *id)?;
-                    }
-                    ObservedTableOp::Remove(table_name, id) => {
-                        debug!("Remove watcher for table {table_name}");
-                        Self::drop_triggers(&mut tx, table_name, *id)?;
-                    }
+        let Some(new_version) = self.should_sync(watcher) else {
+            return Ok(());
+        };
+
+        debug!("Syncing tables from observer");
+        let Some((new_tracker_state, tracker_changes)) = self.calculate_sync_changes(watcher)
+        else {
+            debug!("No changes");
+            return Ok(());
+        };
+
+        let mut tx = connection.sql_transaction()?;
+        for change in tracker_changes {
+            match change {
+                ObservedTableOp::Add(table_name, id) => {
+                    debug!("Add watcher for table {table_name} id={id}");
+                    create_triggers(&mut tx, &table_name, id)?;
+                }
+                ObservedTableOp::Remove(table_name, id) => {
+                    debug!("Remove watcher for table {table_name}");
+                    drop_triggers(&mut tx, &table_name, id)?;
                 }
             }
-            tx.sql_commit_transaction()
-        })?;
+        }
+        tx.sql_commit_transaction()?;
+
+        self.apply_sync_changes(new_tracker_state, new_version);
+
+        Ok(())
+    }
+
+    /// Synchronize the table list from the watcher.
+    ///
+    /// This method will create new triggers for tables that are not being watched over this
+    /// connection and remove triggers for tables that are no longer observed by the watcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if creation or removal of triggers failed.
+    #[tracing::instrument(level=tracing::Level::DEBUG, skip(self, connection, watcher))]
+    pub async fn sync_tables_async<C: SqlConnectionAsync>(
+        &mut self,
+        connection: &mut C,
+        watcher: &Watcher,
+    ) -> Result<(), C::Error> {
+        let Some(new_version) = self.should_sync(watcher) else {
+            return Ok(());
+        };
+
+        debug!("Syncing tables from observer");
+        let Some((new_tracker_state, tracker_changes)) = self.calculate_sync_changes(watcher)
+        else {
+            debug!("No changes");
+            return Ok(());
+        };
+
+        let mut tx = connection.sql_transaction().await?;
+        for change in tracker_changes {
+            match change {
+                ObservedTableOp::Add(table_name, id) => {
+                    debug!("Add watcher for table {table_name} id={id}");
+                    create_triggers_async(&mut tx, &table_name, id).await?;
+                }
+                ObservedTableOp::Remove(table_name, id) => {
+                    debug!("Remove watcher for table {table_name}");
+                    drop_triggers_async(&mut tx, &table_name, id).await?;
+                }
+            }
+        }
+        tx.sql_commit_transaction().await?;
+
+        self.apply_sync_changes(new_tracker_state, new_version);
 
         Ok(())
     }
@@ -193,7 +352,7 @@ impl State {
     ) -> Result<(), C::Error> {
         let mut result = FixedBitSet::with_capacity(self.tracked_tables.len());
 
-        let query = format!("SELECT table_id  FROM {TRACKER_TABLE_NAME} WHERE updated=1");
+        let query = select_updated_tables_query();
         let modified_table_ids = connection.sql_query_values(&query)?;
         for id in modified_table_ids {
             debug!("Table {} has been modified", id);
@@ -202,9 +361,7 @@ impl State {
 
         if !result.is_clear() {
             // Reset updated values.
-            connection.sql_execute(&format!(
-                "UPDATE {TRACKER_TABLE_NAME} SET updated=0 WHERE updated=1"
-            ))?;
+            connection.sql_execute(&reset_updated_tables_query())?;
         }
 
         watcher.publish_changes(result);
@@ -212,71 +369,42 @@ impl State {
         Ok(())
     }
 
-    /// Create tracking triggers for `table` with `id`.
+    /// Check the tracking table and report finding to the [Watcher].
+    ///
+    /// The table where the changes are tracked is read and reset. Any
+    /// table that has been modified will be communicated to the [Watcher], which in turn
+    /// will notify the respective [TableObserver].
     ///
     /// # Errors
     ///
-    /// Return error if the query failed.
-    fn create_triggers<Ex: SqlExecutor>(
-        executor: &mut Ex,
-        table: &str,
-        id: usize,
-    ) -> Result<(), Ex::Error> {
-        use std::fmt::Write;
-        let mut query = String::with_capacity(64);
-        for (trigger, name) in TRIGGER_LIST {
-            query.clear();
-            write!(
-                &mut query,
-                r#"
-CREATE TEMP TRIGGER IF NOT EXISTS {TRACKER_TABLE_NAME}_trigger_{table}_{name} AFTER {trigger} ON {table}
-BEGIN
-    UPDATE  {TRACKER_TABLE_NAME} SET updated=1 WHERE table_id={id};
-END
-            "#
-            )
-                .expect("should not fail");
-            executor.sql_execute(&query)?;
+    /// Returns error if we failed to read from the temporary tables.
+    ///
+    /// [Watcher]: `crate::watcher::Watcher`
+    /// [TableObserver]: `crate::watcher::TableObserver`
+    #[tracing::instrument(level=tracing::Level::DEBUG, skip(self, connection, watcher))]
+    pub async fn publish_changes_async<C: SqlConnectionAsync>(
+        &mut self,
+        connection: &mut C,
+        watcher: &Watcher,
+    ) -> Result<(), C::Error> {
+        let mut result = FixedBitSet::with_capacity(self.tracked_tables.len());
+
+        let query = select_updated_tables_query();
+        let modified_table_ids = connection.sql_query_values(&query).await?;
+        for id in modified_table_ids {
+            debug!("Table {} has been modified", id);
+            result.set(id, true);
         }
 
-        query.clear();
-        write!(
-            &mut query,
-            "INSERT INTO {TRACKER_TABLE_NAME} VALUES ({id},0)"
-        )
-        .expect("Should not fail");
-        executor.sql_execute(&query)?;
-        Ok(())
-    }
-
-    /// Remove tracking triggers for `table` with `id`.
-    ///
-    /// # Errors
-    ///
-    /// Return error if the query failed.
-    fn drop_triggers<Ex: SqlExecutor>(
-        executor: &mut Ex,
-        table: &str,
-        id: usize,
-    ) -> Result<(), Ex::Error> {
-        use std::fmt::Write;
-        let mut query = String::with_capacity(64);
-        for (_, name) in TRIGGER_LIST {
-            query.clear();
-            write!(
-                query,
-                "DROP TRIGGER IF EXISTS {TRACKER_TABLE_NAME}_trigger_{table}_{name}"
-            )
-            .expect("should not fail");
-            executor.sql_execute(&query)?;
+        if !result.is_clear() {
+            // Reset updated values.
+            connection
+                .sql_execute(&reset_updated_tables_query())
+                .await?;
         }
-        query.clear();
-        write!(
-            &mut query,
-            "DELETE FROM {TRACKER_TABLE_NAME} WHERE table_id={id}"
-        )
-        .expect("Should not fail");
-        executor.sql_execute(&query)?;
+
+        watcher.publish_changes_async(result).await;
+
         Ok(())
     }
 
@@ -310,37 +438,7 @@ END
         self.tracked_tables = new_tracker_state;
         self.last_sync_version = new_version;
     }
-
-    /// Check with the `watcher` if there are new tables that require syncing and update
-    /// all the database triggers.
-    fn sync<E, F: FnOnce(&[ObservedTableOp]) -> Result<(), E>>(
-        &mut self,
-        watcher: &Watcher,
-        apply_fn: F,
-    ) -> Result<(), E> {
-        let Some(new_version) = self.should_sync(watcher) else {
-            return Ok(());
-        };
-
-        debug!("Syncing tables from observer");
-        let Some((new_tracker_state, tracker_changes)) = self.calculate_sync_changes(watcher)
-        else {
-            debug!("No changes");
-            return Ok(());
-        };
-        (apply_fn)(&tracker_changes)?;
-        self.apply_sync_changes(new_tracker_state, new_version);
-        Ok(())
-    }
 }
-
-const TRACKER_TABLE_NAME: &str = "rsqlite_watcher_version_tracker";
-
-const TRIGGER_LIST: [(&str, &str); 3] = [
-    ("INSERT", "insert"),
-    ("UPDATE", "update"),
-    ("DELETE", "delete"),
-];
 
 /// Connection abstraction that provides on possible implementation which uses the building
 /// blocks ([`State`]) provided by this crate.
@@ -476,6 +574,102 @@ impl<C: SqlConnection> Connection<C> {
     }
 }
 
+/// Same as [`Connection`] but with an async executor.
+#[allow(clippy::module_name_repetitions)]
+pub struct ConnectionAsync<C: SqlConnectionAsync> {
+    state: State,
+    watcher: Arc<Watcher>,
+    connection: C,
+}
+impl<C: SqlConnectionAsync> ConnectionAsync<C> {
+    /// Create a new connection with `connection` and `watcher`.
+    ///
+    /// See [`State::start_tracking()`] for more information about initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the initialization failed.
+    pub async fn new(mut connection: C, watcher: Arc<Watcher>) -> Result<Self, C::Error> {
+        let state = State::new();
+        State::set_pragmas_async(&mut connection).await?;
+        State::start_tracking_async(&mut connection).await?;
+        Ok(Self {
+            state,
+            watcher,
+            connection,
+        })
+    }
+
+    /// See [`Connection::sync_watcher_tables`] for more details.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if we failed to sync the changes to the database.
+    pub async fn sync_watcher_tables(&mut self) -> Result<(), C::Error> {
+        self.state
+            .sync_tables_async(&mut self.connection, &self.watcher)
+            .await
+    }
+
+    /// See [`Connection::publish_watcher_changes`] for more details.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if we failed to check for changes.
+    pub async fn publish_watcher_changes(&mut self) -> Result<(), C::Error> {
+        self.state
+            .publish_changes_async(&mut self.connection, &self.watcher)
+            .await
+    }
+
+    /// See [`Connection::stop_tracking`] for more details.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the queries failed.
+    pub async fn stop_tracking(&mut self) -> Result<(), C::Error> {
+        self.state
+            .stop_tracking_async(&mut self.connection, &self.watcher)
+            .await
+    }
+
+    /// Consume the current connection and take ownership of the real sql connection.
+    ///
+    /// # Remarks
+    ///
+    /// This does not stop the tracking infrastructure enabled on the connection.
+    /// Use [`Self::stop_tracking()`] to disable it first.
+    pub fn take(self) -> C {
+        self.connection
+    }
+}
+
+impl<C: SqlConnectionAsync> Deref for ConnectionAsync<C> {
+    type Target = C;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl<C: SqlConnectionAsync> DerefMut for ConnectionAsync<C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl<C: SqlConnectionAsync> AsRef<C> for ConnectionAsync<C> {
+    fn as_ref(&self) -> &C {
+        &self.connection
+    }
+}
+
+impl<C: SqlConnectionAsync> AsMut<C> for ConnectionAsync<C> {
+    fn as_mut(&mut self) -> &mut C {
+        &mut self.connection
+    }
+}
+
 impl<C: SqlConnection> Deref for Connection<C> {
     type Target = C;
 
@@ -500,6 +694,170 @@ impl<C: SqlConnection> AsMut<C> for Connection<C> {
     fn as_mut(&mut self) -> &mut C {
         &mut self.connection
     }
+}
+
+const TRACKER_TABLE_NAME: &str = "rsqlite_watcher_version_tracker";
+
+const TRIGGER_LIST: [(&str, &str); 3] = [
+    ("INSERT", "insert"),
+    ("UPDATE", "update"),
+    ("DELETE", "delete"),
+];
+
+#[inline]
+fn create_tracking_table_query() -> String {
+    format!("CREATE TEMP TABLE IF NOT EXISTS `{TRACKER_TABLE_NAME}` (table_id INTEGER PRIMARY KEY, updated INTEGER)")
+}
+#[inline]
+fn empty_tracking_table_query() -> String {
+    format!("DELETE FROM `{TRACKER_TABLE_NAME}`")
+}
+#[inline]
+fn drop_tracking_table_query() -> String {
+    format!("DROP TABLE IF EXISTS `{TRACKER_TABLE_NAME}`")
+}
+
+#[inline]
+fn create_trigger_query(
+    writer: &mut impl std::fmt::Write,
+    table_name: &str,
+    trigger: &str,
+    trigger_name: &str,
+    table_id: usize,
+) {
+    write!(
+        writer,
+        r#"
+CREATE TEMP TRIGGER IF NOT EXISTS `{TRACKER_TABLE_NAME}_trigger_{table_name}_{trigger_name}` AFTER {trigger} ON `{table_name}`
+BEGIN
+    UPDATE  `{TRACKER_TABLE_NAME}` SET updated=1 WHERE table_id={table_id};
+END
+            "#
+    )
+        .expect("should not fail");
+}
+
+#[inline]
+fn insert_table_id_into_tracking_table_query(writer: &mut impl std::fmt::Write, id: usize) {
+    write!(writer, "INSERT INTO `{TRACKER_TABLE_NAME}` VALUES ({id},0)").expect("Should not fail");
+}
+
+#[inline]
+fn drop_trigger_query(writer: &mut impl std::fmt::Write, table_name: &str, trigger_name: &str) {
+    write!(
+        writer,
+        "DROP TRIGGER IF EXISTS `{TRACKER_TABLE_NAME}_trigger_{table_name}_{trigger_name}`"
+    )
+    .expect("should not fail");
+}
+
+#[inline]
+fn remove_table_id_from_tracking_table_query(writer: &mut impl std::fmt::Write, table_id: usize) {
+    write!(
+        writer,
+        "DELETE FROM `{TRACKER_TABLE_NAME}` WHERE table_id={table_id}"
+    )
+    .expect("should not fail");
+}
+
+#[inline]
+fn select_updated_tables_query() -> String {
+    format!("SELECT table_id  FROM `{TRACKER_TABLE_NAME}` WHERE updated=1")
+}
+
+#[inline]
+fn reset_updated_tables_query() -> String {
+    format!("UPDATE `{TRACKER_TABLE_NAME}` SET updated=0 WHERE updated=1")
+}
+
+/// Create tracking triggers for `table` with `id`.
+///
+/// # Errors
+///
+/// Return error if the query failed.
+fn create_triggers<Ex: SqlExecutor>(
+    executor: &mut Ex,
+    table: &str,
+    id: usize,
+) -> Result<(), Ex::Error> {
+    let mut query = String::with_capacity(64);
+    for (trigger, trigger_name) in TRIGGER_LIST {
+        query.clear();
+        create_trigger_query(&mut query, table, trigger, trigger_name, id);
+        executor.sql_execute(&query)?;
+    }
+
+    query.clear();
+    insert_table_id_into_tracking_table_query(&mut query, id);
+    executor.sql_execute(&query)?;
+    Ok(())
+}
+
+/// Create tracking triggers for `table` with `id`.
+///
+/// # Errors
+///
+/// Return error if the query failed.
+async fn create_triggers_async<Ex: SqlExecutorAsync>(
+    executor: &mut Ex,
+    table: &str,
+    id: usize,
+) -> Result<(), Ex::Error> {
+    let mut query = String::with_capacity(64);
+    for (trigger, trigger_name) in TRIGGER_LIST {
+        query.clear();
+        create_trigger_query(&mut query, table, trigger, trigger_name, id);
+        executor.sql_execute(&query).await?;
+    }
+
+    query.clear();
+    insert_table_id_into_tracking_table_query(&mut query, id);
+    executor.sql_execute(&query).await?;
+    Ok(())
+}
+
+/// Remove tracking triggers for `table` with `id`.
+///
+/// # Errors
+///
+/// Return error if the query failed.
+fn drop_triggers<Ex: SqlExecutor>(
+    executor: &mut Ex,
+    table: &str,
+    id: usize,
+) -> Result<(), Ex::Error> {
+    let mut query = String::with_capacity(64);
+    for (_, trigger_name) in TRIGGER_LIST {
+        query.clear();
+        drop_trigger_query(&mut query, table, trigger_name);
+        executor.sql_execute(&query)?;
+    }
+    query.clear();
+    remove_table_id_from_tracking_table_query(&mut query, id);
+    executor.sql_execute(&query)?;
+    Ok(())
+}
+
+/// Remove tracking triggers for `table` with `id`.
+///
+/// # Errors
+///
+/// Return error if the query failed.
+async fn drop_triggers_async<Ex: SqlExecutorAsync>(
+    executor: &mut Ex,
+    table: &str,
+    id: usize,
+) -> Result<(), Ex::Error> {
+    let mut query = String::with_capacity(64);
+    for (_, trigger_name) in TRIGGER_LIST {
+        query.clear();
+        drop_trigger_query(&mut query, table, trigger_name);
+        executor.sql_execute(&query).await?;
+    }
+    query.clear();
+    remove_table_id_from_tracking_table_query(&mut query, id);
+    executor.sql_execute(&query).await?;
+    Ok(())
 }
 
 #[cfg(test)]

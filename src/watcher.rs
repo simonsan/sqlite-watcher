@@ -1,10 +1,10 @@
 use fixedbitset::FixedBitSet;
+use flume::{Receiver, Sender};
 use parking_lot::RwLock;
 use slotmap::{new_key_type, SlotMap};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use tracing::{debug, error};
 
@@ -62,6 +62,14 @@ pub trait TableObserver: Send + Sync {
 /// [State] needs to be used. Check each type for more information on how to use
 /// it correctly.
 ///
+/// # Remarks
+///
+/// The [`Watcher`] currently maintains a list of observed tables that is never pruned. It will
+/// keep growing with every new table that is observed. If you have af fixed set of tables that
+/// you watch on a regular basis this is not an issue. If you have a dynamic list of tables
+/// deleted tables are currently not removed. To be addressed in the future.
+///
+///
 /// [Connection]: `crate::connection::Connection`
 /// [State]: `crate::connection::State`
 pub struct Watcher {
@@ -70,13 +78,15 @@ pub struct Watcher {
     sender: Sender<Command>,
 }
 
+const WATCHER_CHANNEL_CAPACITY: usize = 24;
+
 impl Watcher {
     /// Create a new instance of an in process tracker service.
     ///
     /// # Errors
     /// Returns error if the worker thread fails to spawn.
     pub fn new() -> Result<Arc<Self>, Error> {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = flume::bounded(WATCHER_CHANNEL_CAPACITY);
         let watcher = Arc::new(Self {
             tables: RwLock::new(ObservedTables::new()),
             tables_version: AtomicU64::new(0),
@@ -107,10 +117,6 @@ impl Watcher {
         &self,
         observer: Box<dyn TableObserver>,
     ) -> Result<TableObserverHandle, Error> {
-        self.with_tables_mut(|tables| {
-            tables.track_tables(observer.tables().iter().cloned());
-        });
-
         let (sender, receiver) = oneshot::channel();
         if self
             .sender
@@ -177,6 +183,17 @@ impl Watcher {
         }
     }
 
+    pub(crate) async fn publish_changes_async(&self, table_ids: FixedBitSet) {
+        if self
+            .sender
+            .send_async(Command::PublishChanges(table_ids))
+            .await
+            .is_err()
+        {
+            error!("Watcher could not communicate with background thread");
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn get_table_id(&self, table: &str) -> Option<usize> {
         self.with_tables(|tables| tables.table_ids.get(table).cloned())
@@ -229,6 +246,9 @@ impl Watcher {
 
             match command {
                 Command::AddObserver(observer, reply) => {
+                    watcher.with_tables_mut(|tables| {
+                        tables.track_tables(observer.tables().iter().cloned());
+                    });
                     let handle = observers.insert(observer);
                     if reply.send(handle).is_err() {
                         error!(

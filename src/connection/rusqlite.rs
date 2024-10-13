@@ -3,11 +3,10 @@
 //! Requires the `rusqlite` feature to be enabled.
 use crate::connection::{SqlConnection, SqlExecutor, SqlTransaction};
 use rusqlite::{Connection, Transaction};
-use std::ops::Deref;
 
 impl SqlExecutor for Connection {
     type Error = rusqlite::Error;
-    fn sql_query_values(&self, query: &str) -> Result<Vec<usize>, Self::Error> {
+    fn sql_query_values(&mut self, query: &str) -> Result<Vec<usize>, Self::Error> {
         let mut stmt = self.prepare(query)?;
         let rows = stmt.query_map((), |r| r.get(0))?;
         let mut table_ids = Vec::new();
@@ -30,8 +29,14 @@ impl SqlConnection for Connection {
 
 impl<'c> SqlExecutor for Transaction<'c> {
     type Error = rusqlite::Error;
-    fn sql_query_values(&self, query: &str) -> Result<Vec<usize>, Self::Error> {
-        self.deref().sql_query_values(query)
+    fn sql_query_values(&mut self, query: &str) -> Result<Vec<usize>, Self::Error> {
+        let mut stmt = self.prepare(query)?;
+        let rows = stmt.query_map((), |r| r.get(0))?;
+        let mut table_ids = Vec::new();
+        for row in rows {
+            table_ids.push(row?);
+        }
+        Ok(table_ids)
     }
 
     fn sql_execute(&mut self, query: &str) -> Result<(), Self::Error> {
