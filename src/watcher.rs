@@ -109,10 +109,6 @@ impl Watcher {
         &self,
         observer: Box<dyn TableObserver>,
     ) -> Result<TableObserverHandle, Error> {
-        self.with_tables_mut(|tables| {
-            tables.track_tables(observer.tables().iter().cloned());
-        });
-
         let (sender, receiver) = oneshot::channel();
         if self
             .sender
@@ -241,6 +237,9 @@ impl Watcher {
 
             match command {
                 Command::AddObserver(observer, reply) => {
+                    watcher.with_tables_mut(|tables| {
+                        tables.track_tables(observer.tables().iter().cloned());
+                    });
                     let handle = observers.insert(observer);
                     if reply.send(handle).is_err() {
                         error!(
