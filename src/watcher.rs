@@ -4,8 +4,8 @@ use slotmap::{new_key_type, SlotMap};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use flume::{Receiver, Sender};
 use tracing::{debug, error};
 
 new_key_type! {
@@ -70,13 +70,15 @@ pub struct Watcher {
     sender: Sender<Command>,
 }
 
+const WATCHER_CHANNEL_CAPACITY: usize = 24;
+
 impl Watcher {
     /// Create a new instance of an in process tracker service.
     ///
     /// # Errors
     /// Returns error if the worker thread fails to spawn.
     pub fn new() -> Result<Arc<Self>, Error> {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = flume::bounded(WATCHER_CHANNEL_CAPACITY);
         let watcher = Arc::new(Self {
             tables: RwLock::new(ObservedTables::new()),
             tables_version: AtomicU64::new(0),
@@ -171,6 +173,16 @@ impl Watcher {
         if self
             .sender
             .send(Command::PublishChanges(table_ids))
+            .is_err()
+        {
+            error!("Watcher could not communicate with background thread");
+        }
+    }
+
+    pub(crate) async fn publish_changes_async(&self, table_ids: FixedBitSet) {
+        if self
+            .sender
+            .send_async(Command::PublishChanges(table_ids)).await
             .is_err()
         {
             error!("Watcher could not communicate with background thread");
