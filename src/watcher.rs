@@ -5,12 +5,46 @@ use slotmap::{new_key_type, SlotMap};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tracing::{debug, error};
 
 new_key_type! {
     /// Handle for a [`TableObserver`].
     pub struct TableObserverHandle;
+}
+
+/// Utility type that removes an observer from a [`Watcher`] when the type is dropped.
+///
+/// The [`TableObserver`] will be removed with [`Watcher::remove_observer_deferred()`].
+#[derive(Debug, Clone)]
+pub struct DropRemoveTableObserverHandle {
+    watcher: Weak<Watcher>,
+    handle: TableObserverHandle,
+}
+
+impl DropRemoveTableObserverHandle {
+    fn new(handle: TableObserverHandle, watcher: &Arc<Watcher>) -> Self {
+        Self {
+            watcher: Arc::downgrade(watcher),
+            handle,
+        }
+    }
+
+    /// Returns the handle of the table observer.
+    #[must_use]
+    pub fn handle(&self) -> TableObserverHandle {
+        self.handle
+    }
+}
+
+impl Drop for DropRemoveTableObserverHandle {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.upgrade() {
+            if watcher.remove_observer_deferred(self.handle).is_err() {
+                error!("Failed to remove watcher from observer on drop");
+            }
+        }
+    }
 }
 
 /// Defines an observer for a set of tables.
@@ -133,6 +167,22 @@ impl Watcher {
         };
 
         Ok(handle)
+    }
+
+    /// Same as [`Self::add_observer`], but returns a handle that removes the observer
+    /// from this [`Watcher`] on drop.
+    ///
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::add_observer`] for more details.
+    pub fn add_observer_with_drop_remove(
+        self: &Arc<Self>,
+        observer: Box<dyn TableObserver>,
+    ) -> Result<DropRemoveTableObserverHandle, Error> {
+        let handle = self.add_observer(observer)?;
+
+        Ok(DropRemoveTableObserverHandle::new(handle, self))
     }
 
     /// Remove an observer via its `handle` without waiting for the operation to complete.
